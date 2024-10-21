@@ -1,352 +1,202 @@
-#if defined(ESP32)
-#include <WiFi.h>
-#elif defined(ESP8266)
-#include <ESP8266WiFi.h>
-#endif
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <TM1637Display.h>
+#include <Keypad.h>
+#include <RTClib.h>
 
-#include <NTPClient.h>
-#include <WiFiUdp.h>
-#include <Firebase_ESP_Client.h>
+// Inisialisasi untuk LCD I2C
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-// Provide the token generation process info.
-#include <addons/TokenHelper.h>
+// Inisialisasi untuk 7-segment display
+#define CLK 13
+#define DIO 15
+TM1637Display display(CLK, DIO);
 
-/* 1. Define the WiFi credentials */
-#define WIFI_SSID "PRIMA TP LINK LANTAI 2"
-#define WIFI_PASSWORD "DUAPRIMA2020"
+// Inisialisasi RTC
+RTC_DS3231 rtc;
 
-/* 2. Define the API Key */
-#define API_KEY "AIzaSyCUIn8Vef9vI7y_989f_j7RA1ihBOZilvQ"
+// Konfigurasi pin untuk LED
+#define GREEN_LED 18
+#define YELLOW_LED 19
+#define RED_LED 21
 
-/* 3. Define the project ID */
-#define FIREBASE_PROJECT_ID "hidroponik-iot"
+// Konfigurasi pin untuk switch dan button
+#define SWITCH_PIN 34
+#define BUTTON_PIN 35
 
-/* 4. Define the user Email and password that alreadey registerd or added in your project */
-#define USER_EMAIL "zaidanr4f1@gmail.com"
-#define USER_PASSWORD "Zaidan12345"
+// Konfigurasi keypad
+const byte ROWS = 4;
+const byte COLS = 4;
+char keys[ROWS][COLS] = {
+  {'2', '1', '3', 'A'},
+  {'0', '*', '#', 'D'},
+  {'8', '7', '9', 'C'},
+  {'5', '4', '6', 'B'}
+};
+byte rowPins[ROWS] = {14, 25, 26, 27}; // Pin baris
+byte colPins[COLS] = {32, 33, 4, 5};   // Pin kolom
 
-//reset board
-void(* di_reset) (void) = 0;
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
-//SUHU UDARA
-#include <Adafruit_Sensor.h>
-#include <DHT.h>
-#include <DHT_U.h>
+// Variabel untuk menyimpan input angka sementara dan nilai yang ditampilkan
+int inputValue = 0;
+int displayedValue = 0;
+bool inputPending = false; // Menandai jika ada input yang belum ditampilkan
 
-#define DHTPIN D4     // Digital pin connected to the DHT sensor 
+// Waktu debounce untuk input keypad
+unsigned long lastKeyPressTime = 0;
+const unsigned long debounceDelay = 50; // 50 ms debounce
 
-#define DHTTYPE    DHT11     // DHT 11
+void setup() {
+  // Inisialisasi I2C dengan pin custom
+  Wire.begin(22, 23);
 
-DHT_Unified dht(DHTPIN, DHTTYPE);
+  // Inisialisasi LCD
+  lcd.begin(16, 2);
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("System Init...");
 
-uint32_t delayMS;
+  // Inisialisasi display 7-segment
+  display.setBrightness(0x0f);
+  display.showNumberDec(0);
 
-float suhuUdara;
-float kelembapanUdara;
+  // Inisialisasi LED sebagai output
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(YELLOW_LED, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+  digitalWrite(RED_LED, HIGH); // Menyalakan LED merah
 
+  // Inisialisasi switch dan button sebagai input dengan PULLUP
+  pinMode(SWITCH_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
 
-// Define Firebase Data object
-FirebaseData fbdo;
+  // Inisialisasi RTC
+  if (!rtc.begin()) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("RTC Not Found");
+    while (1); // Berhenti jika RTC tidak terhubung
+  }
 
-FirebaseAuth auth;
-FirebaseConfig config;
+  // Cek apakah RTC berjalan atau perlu disetel ulang
+  if (rtc.lostPower()) {
+    // Setel waktu RTC secara manual
+    rtc.adjust(DateTime(2024, 10, 20, 14, 30, 0));  // Sesuaikan dengan waktu saat ini
+  }
 
-unsigned long dataMillis = 0;
-int count = 0;
-int count1 = 0;
+  // Menampilkan pesan awal pada LCD
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Ready!");
 
-// The Firestore payload upload callback function
-void fcsUploadCallback(CFS_UploadStatusInfo info)
-{
-    if (info.status == fb_esp_cfs_upload_status_init)
-    {
-        Serial.printf("\nUploading data (%d)...\n", info.size);
-    }
-    else if (info.status == fb_esp_cfs_upload_status_upload)
-    {
-        Serial.printf("Uploaded %d%s\n", (int)info.progress, "%");
-    }
-    else if (info.status == fb_esp_cfs_upload_status_complete)
-    {
-        Serial.println("Upload completed ");
-    }
-    else if (info.status == fb_esp_cfs_upload_status_process_response)
-    {
-        Serial.print("Processing the response... ");
-    }
-    else if (info.status == fb_esp_cfs_upload_status_error)
-    {
-        Serial.printf("Upload failed, %s\n", info.errorMsg.c_str());
-    }
+  // Inisialisasi Serial Monitor
+  Serial.begin(115200);
 }
 
-// Define NTP Client to get time
-WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP);
+void loop() {
+  // Membaca input dari switch dan button
+  int switchState = digitalRead(SWITCH_PIN);
+  int buttonState = digitalRead(BUTTON_PIN);
 
-void setup()
-{
+  // Tampilkan status switch dan button di Serial Monitor
+  Serial.print("Switch state: ");
+  Serial.println(switchState == HIGH ? "ON" : "OFF");
+  Serial.print("Button state: ");
+  Serial.println(buttonState == LOW ? "RELEASED" : "PRESSED");
 
-    Serial.begin(57600);
+  // Reset semua jika switch dalam keadaan OFF
+  if (switchState == LOW) {
+    // Reset nilai dan tampilan
+    display.clear();
+    lcd.clear();
+    inputValue = 0;
+    displayedValue = 0;
+    inputPending = false;
 
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    Serial.print("Connecting to Wi-Fi");
-    while (WiFi.status() != WL_CONNECTED)
-    {
-        Serial.print(".");
-        delay(300);
-    }
-    Serial.println();
-    Serial.print("Connected with IP: ");
-    Serial.println(WiFi.localIP());
-    Serial.println();
-
-    Serial.printf("Firebase Client v%s\n\n", FIREBASE_CLIENT_VERSION);
-
-    /* Assign the api key (required) */
-    config.api_key = API_KEY;
-
-    /* Assign the user sign in credentials */
-    auth.user.email = USER_EMAIL;
-    auth.user.password = USER_PASSWORD;
-
-    /* Assign the callback function for the long running token generation task */
-    config.token_status_callback = tokenStatusCallback; // see addons/TokenHelper.h
-
-#if defined(ESP8266)
-    // In ESP8266 required for BearSSL rx/tx buffer for large data handle, increase Rx size as needed.
-    fbdo.setBSSLBufferSize(2048 /* Rx buffer size in bytes from 512 - 16384 */, 2048 /* Tx buffer size in bytes from 512 - 16384 */);
-#endif
+    lcd.setCursor(0, 0);
+    lcd.print("Ready!"); // Tampilan setelah reset
     
-    // Limit the size of response payload to be collected in FirebaseData
-    fbdo.setResponseSize(2048);
-
-    Firebase.begin(&config, &auth);
-
-    Firebase.reconnectWiFi(true);
-
-    // For sending payload callback
-    // config.cfs.upload_callback = fcsUploadCallback;
-
-  timeClient.begin();
-
-  timeClient.setTimeOffset(0);
-
-
-  //SUHU UDARA
-  //Serial.begin(57600);
-  // Initialize device.
-  dht.begin();
-  //Serial.println(F("DHTxx Unified Sensor Example"));
-  // Print temperature sensor details.
-  sensor_t sensor;
-  dht.temperature().getSensor(&sensor);
-/*  Serial.println(F("------------------------------------"));
-  Serial.println(F("Temperature Sensor"));
-  Serial.print  (F("Sensor Type: ")); Serial.println(sensor.name);
-  Serial.print  (F("Driver Ver:  ")); Serial.println(sensor.version);
-  Serial.print  (F("Unique ID:   ")); Serial.println(sensor.sensor_id);
-  Serial.print  (F("Max Value:   ")); Serial.print(sensor.max_value); Serial.println(F("°C"));
-  Serial.print  (F("Min Value:   ")); Serial.print(sensor.min_value); Serial.println(F("°C"));
-  Serial.print  (F("Resolution:  ")); Serial.print(sensor.resolution); Serial.println(F("°C"));
-  Serial.println(F("------------------------------------"));
-  // Print humidity sensor details.
-  dht.humidity().getSensor(&sensor);
-  Serial.println(F("Humidity Sensor"));
-  Serial.print  (F("Sensor Type: ")); Serial.println(sensor.name);
-  Serial.print  (F("Driver Ver:  ")); Serial.println(sensor.version);
-  Serial.print  (F("Unique ID:   ")); Serial.println(sensor.sensor_id);
-  Serial.print  (F("Max Value:   ")); Serial.print(sensor.max_value); Serial.println(F("%"));
-  Serial.print  (F("Min Value:   ")); Serial.print(sensor.min_value); Serial.println(F("%"));
-  Serial.print  (F("Resolution:  ")); Serial.print(sensor.resolution); Serial.println(F("%"));
-  Serial.println(F("------------------------------------"));
-*/  // Set delay between sensor readings based on sensor details.
-  //delayMS = sensor.min_delay / 1000;
-
-}
-void loop(void){
-  //SUHU UDARA
-  // Delay between measurements.
-  //delay(delayMS);
-  // Get temperature event and print its value.
-  sensors_event_t event;
-  dht.temperature().getEvent(&event);
-  if (isnan(event.temperature)) {
-   Serial.println(F("Error reading temperature!")); 
+    // Nyalakan LED merah jika switch OFF
+    digitalWrite(RED_LED, HIGH);
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(YELLOW_LED, LOW);
+    return;
   }
-  else {
-/*    Serial.print(F("Temperature: "));
-    Serial.print(event.temperature);
-    Serial.println(F("°C")); */
-    suhuUdara = event.temperature;
-  }
-  // Get humidity event and print its value.
-  dht.humidity().getEvent(&event);
-  if (isnan(event.relative_humidity)) {
-    Serial.println(F("Error reading humidity!"));  
-  }
-  else {
-    //Serial.print(F("Humidity: "));
-    //Serial.print(event.relative_humidity);
-    //Serial.println(F("%"));
-    kelembapanUdara = event.relative_humidity;
-  }/*
-  Serial.println();
-*/
 
-
-
-
-/////////firebase
-    //current time 
-  timeClient.update();
-
-  time_t epochTime = timeClient.getEpochTime();
-
-  //Serial.println(timeClient.getFormattedTime());
-
-  //get days
-  ////String weekDay = weekDays[timeClient.getDay()];
-  //Serial.print("Hari: ");
-  //Serial.println(weekDay);
-
-  //Get a time structure
-  struct tm *ptm = gmtime ((time_t *)&epochTime); 
-
-  int monthDay = ptm->tm_mday;
-  int currentMonth = ptm->tm_mon+1;
-  int currentYear = ptm->tm_year+1900;
-
-  String currentDate = String(currentYear) + "-" + String(currentMonth) + "-" + String(monthDay) + "T" + timeClient.getFormattedTime() + "Z";
-/*  Serial.print("Current date: ");
-  Serial.println(currentDate);
-*/
-  //delay(1000);
-
+  // Jika switch ON, memungkinkan input dari keypad
+  char key = keypad.getKey();
   
-if (Firebase.ready() && (millis() - dataMillis > 500 || dataMillis == 0))
-    {
-        dataMillis = millis();
-
-        FirebaseJson content;
-        String documentPathData = "hydroponic/data";
-
-        content.set("fields/airtemp/doubleValue", suhuUdara);
-        content.set("fields/airhumidity/doubleValue", kelembapanUdara);
-        //content.set("fields/watervolume/doubleValue", tinggiAir);
-
-        String doc_path = "projects/";
-        doc_path += FIREBASE_PROJECT_ID;
-        doc_path += "/databases/(default)/documents/hydroponic/airtemp"; // coll_id and doc_id are your collection id and document id
-        doc_path += "/databases/(default)/documents/hydroponic/airhumidity"; // coll_id and doc_id are your collection id and document id
-
-        // timestamp
-        content.set("fields/time/timestampValue", currentDate); // RFC3339 UTC "Zulu" format
-        
-        if(count1 == 0){
-              if (Firebase.Firestore.deleteDocument(&fbdo, FIREBASE_PROJECT_ID, "" /* databaseId can be (default) or empty */, documentPathData.c_str()))
-                Serial.printf("ok deleted\n%s\n\n", fbdo.payload().c_str());
-              else
-                Serial.println(fbdo.errorReason());
-            }
-
-        if(count1 != 0){
-          if (Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "" /* databaseId can be (default) or empty */, documentPathData.c_str(), content.raw()))
-              Serial.printf("ok stored\n%s\n\n", fbdo.payload().c_str());
-          else
-              Serial.println(fbdo.errorReason()); 
-        }
-        
-        count1++;
-        delay(4300);
-
-        while(count1 == 2){  
-          count1 = 0;
-        }
-
-
-
-/////////////////////////////////////////////////////////////////////////////////////////////
-////////////////////////////////////////////////////////////////////////////////////////////
-/*
-      if (Firebase.ready() && (millis() - dataMillis > 3000 || dataMillis == 0))
-    {
-        dataMillis = millis();
-
-        FirebaseJson content;
-
-        // We will create the nested document in the parent path "a0/b0/c0
-        // a0 is the collection id, b0 is the document id in collection a0 and c0 is the collection id in the document b0.
-        // and d? is the document id in the document collection id c0 which we will create.
-        String documentPathAirTemp = "hydroponic/airtemp" + String(count);
-        
-        // If the document path contains space e.g. "a b c/d e f"
-        // It should encode the space as %20 then the path will be "a%20b%20c/d%20e%20f"
-
-        // double
-        content.set("fields/temp/doubleValue", 32.5);
-
-        String doc_path = "projects/";
-        doc_path += FIREBASE_PROJECT_ID;
-        doc_path += "/databases/(default)/documents/coll_id/doc_id"; // coll_id and doc_id are your collection id and document id
-
-        // timestamp
-        content.set("fields/time/timestampValue", currentDate); // RFC3339 UTC "Zulu" format
-
-
-        // map
-       // content.set("fields/myMap/mapValue/fields/name/stringValue", "wrench");
-       // content.set("fields/myMap/mapValue/fields/mass/stringValue", "1.3kg");
-       // content.set("fields/myMap/mapValue/fields/count/integerValue", "3");
-
-        count++;
-        
-        //delete
-                      if (Firebase.Firestore.deleteDocument(&fbdo, FIREBASE_PROJECT_ID, "" , documentPathAirTemp.c_str()))
-                Serial.printf("ok deleted\n%s\n\n", fbdo.payload().c_str());
-              else
-                Serial.println(fbdo.errorReason());
-
-
-            
-
-       //create
-        Serial.print("Create a document... ");
-
-        
-        
-
-        
-        if (Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "" , documentPathAirTemp.c_str(), content.raw()))
-            Serial.printf("ok stored\n%s\n\n", fbdo.payload().c_str());
-        else
-            Serial.println(fbdo.errorReason()); 
-
-        
-           
-            
-        while(count == 4){  
-          count = 0;
-        }
-        
-    }
-
-*/
-                
-    }
-    else if(!Firebase.ready()){
-      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-      Firebase.begin(&config, &auth);
-      Firebase.reconnectWiFi(true);
-    }
-        ///////////
-        /////////////////////////////////////////////////////////////////////////////////////////////////////////
-    // Firebase.ready() should be called repeatedly to handle authentication tasks.
-
+  // Menambahkan debounce untuk input keypad
+  if (key && (millis() - lastKeyPressTime > debounceDelay)) {
+    lastKeyPressTime = millis(); // Simpan waktu terakhir tombol ditekan
     
+    // Memproses input angka saja
+    if (key >= '0' && key <= '9') {
+      int num = key - '0';
+      // Menghindari overflow di atas 255
+      if (inputValue * 10 + num <= 255) {
+        inputValue = inputValue * 10 + num;
+        inputPending = true; // Tandai bahwa ada input yang belum ditampilkan
+      }
+    } else if (key == '*') {
+      // Menghapus input jika '*' ditekan
+      inputValue = 0;
+      inputPending = true; // Tandai bahwa ada perubahan input
+    }
+  }
 
-/////////////////////////////////////////////////////////////////////////////
-/////////////////////////////////////////////////////////////////////////////////
+  // Jika tombol ditekan dan ada input yang belum ditampilkan
+  if (buttonState == HIGH && inputPending) {
+    // Update nilai yang ditampilkan
+    displayedValue = inputValue; 
+    inputPending = false; // Reset status input pending
 
-    
+    // Tampilkan nilai pada LCD, 7-segment, dan Serial Monitor
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Value: ");
+    lcd.print(displayedValue);
+    display.showNumberDec(displayedValue);
+
+    Serial.print("Value: ");
+    Serial.println(displayedValue);
+
+    // Reset input setelah ditampilkan agar input baru mengganti angka sebelumnya
+    inputValue = 0;
+
+    // Menyalakan LED sesuai dengan angka genap atau ganjil
+    if (displayedValue % 2 == 0) {
+      // Jika angka genap, nyalakan LED kuning
+      digitalWrite(YELLOW_LED, HIGH);
+      digitalWrite(GREEN_LED, LOW);
+    } else {
+      // Jika angka ganjil, nyalakan LED hijau
+      digitalWrite(GREEN_LED, HIGH);
+      digitalWrite(YELLOW_LED, LOW);
+    }
+
+    // Matikan LED merah karena switch dalam keadaan ON
+    digitalWrite(RED_LED, LOW);
+
+    delay(200); // Debouncing button press
+  }
+
+  // Menampilkan waktu dari RTC di baris kedua LCD
+  DateTime now = rtc.now();
+  lcd.setCursor(0, 1);
+  lcd.print(now.year());
+  lcd.print('/');
+  lcd.print(now.month());
+  lcd.print('/');
+  lcd.print(now.day());
+  lcd.print(' ');
+  lcd.print(now.hour());
+  lcd.print(':');
+  lcd.print(now.minute());
+  lcd.print(':');
+  lcd.print(now.second());
+
+  // Simpan jeda minimum untuk stabilitas (kurangi delay untuk meningkatkan kecepatan)
+  delay(10);
 }
